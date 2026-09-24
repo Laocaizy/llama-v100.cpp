@@ -108,6 +108,10 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
+// number of top logits kept by the set_logits() fast path. stays <= 128 so that
+// top_k keeps using std::partial_sort in llama_token_data_array_partial_sort_inplace
+static constexpr int SAMPLER_CROP_K = 128;
+
 struct common_sampler {
     common_params_sampling params;
 
@@ -121,10 +125,80 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    bool logit_crop = false; // keep only the top SAMPLER_CROP_K logits, see set_logits()
+
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
+    }
+
+    // Keep only the top SAMPLER_CROP_K logits of row idx in one pass, without
+    // materializing the n_vocab candidates. Returns false when the crop can not
+    // reproduce the full partial_sort exactly.
+    bool set_logits_crop(struct llama_context * ctx, int idx, int n_vocab) {
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+
+        const auto cmp = [](const llama_token_data & a, const llama_token_data & b) {
+            return a.logit > b.logit;
+        };
+
+        const int k = params.top_k;
+
+        cur.resize(SAMPLER_CROP_K);
+
+        float max_dropped = -INFINITY;
+
+        int n = 0;
+        for (llama_token token_id = 0; token_id < n_vocab; ++token_id) {
+            const float v = logits[token_id];
+            if (n < SAMPLER_CROP_K) {
+                cur[n++] = llama_token_data{token_id, v, 0.0f};
+                if (n == SAMPLER_CROP_K) {
+                    std::make_heap(cur.begin(), cur.end(), cmp);
+                }
+            } else if (v > cur.front().logit) {
+                if (cur.front().logit > max_dropped) {
+                    max_dropped = cur.front().logit;
+                }
+                std::pop_heap(cur.begin(), cur.end(), cmp);
+                cur[n - 1] = llama_token_data{token_id, v, 0.0f};
+                std::push_heap(cur.begin(), cur.end(), cmp);
+            } else if (v > max_dropped) {
+                max_dropped = v;
+            }
+        }
+
+        if (n == 0) {
+            return false;
+        }
+
+        if (n < SAMPLER_CROP_K) {
+            std::sort(cur.begin(), cur.begin() + n, cmp);
+        } else {
+            std::sort_heap(cur.begin(), cur.end(), cmp);
+        }
+
+        // the top-k ranks must be strictly ordered, else the dropped candidates could
+        // break ties differently than the full partial_sort
+        const int k_eff = std::min(k, n);
+        for (int i = 0; i + 1 < k_eff; ++i) {
+            if (cur[i].logit <= cur[i + 1].logit) {
+                return false;
+            }
+        }
+        if (k_eff < n) {
+            if (cur[k_eff - 1].logit <= cur[k_eff].logit) {
+                return false;
+            }
+        } else if (max_dropped >= cur[n - 1].logit) {
+            return false;
+        }
+
+        cur.resize(n);
+
+        return true;
     }
 
     void set_logits(struct llama_context * ctx, int idx) {
@@ -149,6 +223,8 @@ struct common_sampler {
             for (uint32_t i = 0; i < sampled_logits_count; i++) {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
             }
+        } else if (logit_crop && set_logits_crop(ctx, idx, n_vocab)) {
+            // cur already holds the top SAMPLER_CROP_K candidates
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
@@ -182,6 +258,46 @@ std::string common_params_sampling::print() const {
             mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay);
 
     return std::string(result);
+}
+
+// True when set_logits() may keep only the top SAMPLER_CROP_K logits. top_k must be
+// the first sampler with an effect, because the crop hides the rest of the vocab
+// from every sampler that runs before it.
+static bool logit_crop_allowed(const struct llama_model * model, const struct common_params_sampling & params) {
+    if (params.mirostat != 0) {
+        return false;
+    }
+    if (params.top_k <= 0 || params.top_k > SAMPLER_CROP_K) {
+        return false;
+    }
+    if (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f ||
+        params.dry_multiplier != 0.0f || params.top_n_sigma > 0.0f) {
+        return false;
+    }
+    if (!params.logit_bias.empty() || !params.grammar.empty()) {
+        return false;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    int32_t n_suppress = 0;
+    llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+    if (n_suppress > 0) {
+        return false;
+    }
+
+    for (const auto & type : params.samplers) {
+        if (type == COMMON_SAMPLER_TYPE_TOP_K) {
+            return true;
+        }
+        if (type != COMMON_SAMPLER_TYPE_PENALTIES &&
+            type != COMMON_SAMPLER_TYPE_DRY &&
+            type != COMMON_SAMPLER_TYPE_TOP_N_SIGMA) {
+            return false;
+        }
+    }
+
+    return false;
 }
 
 struct common_sampler * common_sampler_init(
@@ -434,6 +550,8 @@ struct common_sampler * common_sampler_init(
         /* .cur_p   = */ {},
     };
 
+    result->logit_crop = grmr == nullptr && rbudget == nullptr && logit_crop_allowed(model, params);
+
     return result;
 }
 
@@ -515,6 +633,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .logit_crop = */ gsmpl->logit_crop,
     };
 }
 
@@ -535,6 +654,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur        = src->cur;
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    dst->logit_crop = src->logit_crop;
     dst->t_total_us = src->t_total_us;
 }
 

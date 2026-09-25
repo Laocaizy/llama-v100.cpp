@@ -121,6 +121,12 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 128, 2,  32, 160, 128,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 256, 1,  32, 160, 128,  64, 1, false);
 
+    // DKQ=DV=256, ncols=64 (qwen35 prefill). The Ampere fallback keeps Q in registers, but for
+    // D256 Q_B + VKQ_C already need 256 registers, so it always spills into the MMA loop.
+    // Q in shared memory with 8 warps and nbatch_fa 64 removes the spills: ~+47% throughput.
+    // nbatch_fa must be 32/64/128 here; 96 or 160 silently break the mask layout.
+    // See v100/RESULTS.md 46-48.
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 1, 64, 128, 128, 64, 1, false);
     // TODO tune specifically for Volta
     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
 }

@@ -124,9 +124,12 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     // DKQ=DV=256, ncols=64 (qwen35 prefill). The Ampere fallback keeps Q in registers, but for
     // D256 Q_B + VKQ_C already need 256 registers, so it always spills into the MMA loop.
     // Q in shared memory with 8 warps and nbatch_fa 64 removes the spills: ~+47% throughput.
+    // 2 stages additionally split the K and V buffers and preload K for the next block before the
+    // VKQ of the current one: another ~+6%. A full V tile does not fit next to a full K tile, so V
+    // is loaded in 2 chunks (nbatch_V2 64).
     // nbatch_fa must be 32/64/128 here; 96 or 160 silently break the mask layout.
-    // See v100/RESULTS.md 46-48.
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 1, 64, 128, 128, 64, 1, false);
+    // See v100/RESULTS.md 46-49.
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 1, 64, 128, 64, 64, 2, false);
     // TODO tune specifically for Volta
     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
 }
@@ -352,20 +355,31 @@ static __host__ int get_cols_per_warp(const int cc) {
 
 // ------------------------------------------------------------------------------------------------------------------
 
+// Multi-stage loading separates the K and V buffers and issues the loads earlier. Volta has no
+// cp.async, so there the loads stay synchronous and only the buffer separation remains.
+#if defined(CP_ASYNC_AVAILABLE)
+static constexpr bool cp_async_supported = true;
+#else
+static constexpr bool cp_async_supported = false;
+#endif // CP_ASYNC_AVAILABLE
+
 static __host__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, const int DV, const int ncols1, const int ncols2, const int cc) {
-    return cp_async_available(cc) && ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2, cc) : 0;
+    if (!cp_async_available(cc) && !volta_mma_available(cc)) {
+        return 0;
+    }
+    return ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2, cc) : 0;
 }
 
 static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
         const int DKQ, const int DV, const int ncols1, const int ncols2, const bool use_sparse) {
-#ifdef CP_ASYNC_AVAILABLE
+#if defined(CP_ASYNC_AVAILABLE) || defined(VOLTA_MMA_AVAILABLE)
     const int nstages_target = ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2) : 0;
     // sparse gather is not implemented for multi-stage loading
     return use_sparse && nstages_target > 1 ? 1 : nstages_target;
 #else
     GGML_UNUSED_VARS(DKQ, DV, ncols1, ncols2, use_sparse);
     return 0;
-#endif // CP_ASYNC_AVAILABLE
+#endif // defined(CP_ASYNC_AVAILABLE) || defined(VOLTA_MMA_AVAILABLE)
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -630,14 +644,19 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         static_assert(!oob_check, "OOB check incompatible with multi-stage pipeline");
         static_assert(!V_is_K_view, "K data reuse not implemented multi-stage loading");
         static_assert(nbatch_K2 == DKQ/2, "batching not implemented for multi stage loading");
-        constexpr bool use_cp_async = true;
-        cp_async_wait_all();
+        constexpr bool use_cp_async = cp_async_supported;
+        if constexpr (use_cp_async) {
+            cp_async_wait_all();
+        }
         __syncthreads();
-        flash_attn_ext_f16_load_tile<stride_tile_V, swz_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
-            (V_h2, tile_V, nbatch_V2, stride_V, k_VKQ_0, k_VKQ_sup, nullptr);
+        if constexpr (nbatch_V2 == DV/2) {
+            flash_attn_ext_f16_load_tile<stride_tile_V, swz_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                (V_h2, tile_V, nbatch_V2, stride_V, k_VKQ_0, k_VKQ_sup, nullptr);
+        }
+        // With a partial V tile the chunks are loaded by the VKQ loop below.
     } else {
         // the sparse mask values are gathered per element, always load them synchronously
-        constexpr bool use_cp_async = nstages == 1 && !use_sparse;
+        constexpr bool use_cp_async = cp_async_supported && nstages == 1 && !use_sparse;
         if (ncols2 > 1 || mask_h) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                 (mask_h, tile_mask, stride_mask, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, indices);
@@ -652,10 +671,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
         if constexpr (nstages <= 1) {
             const int k0_diff = k0_stop - k0_start;
-            constexpr bool use_cp_async = nstages == 1;
+            constexpr bool use_cp_async = cp_async_supported && nstages == 1;
             flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                 (K_h2 + k0_start, tile_K, k0_diff, stride_K, k_VKQ_0, k_VKQ_sup, indices);
-            if (use_cp_async) {
+            if constexpr (use_cp_async) {
                 cp_async_wait_all();
             }
             __syncthreads();
@@ -982,8 +1001,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         static_assert(!use_sparse, "sparse gather not implemented for multi-stage loading");
         static_assert(!V_is_K_view, "K data reuse not implemented multi-stage loading");
         // Preload K tile for next iteration:
-        constexpr bool use_cp_async = true;
-        cp_async_wait_all();
+        constexpr bool use_cp_async = cp_async_supported;
+        if constexpr (use_cp_async) {
+            cp_async_wait_all();
+        }
         __syncthreads();
         if (!last_iter) {
             if (ncols2 > 1 || mask_h) {
@@ -1005,14 +1026,28 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if constexpr (nstages <= 1) {
             const int i0_diff = i0_stop - i0_start;
             if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
-                constexpr bool use_cp_async = nstages == 1;
+                constexpr bool use_cp_async = cp_async_supported && nstages == 1;
                 flash_attn_ext_f16_load_tile<stride_tile_V, swz_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                     (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, indices);
-                if (use_cp_async) {
+                if constexpr (use_cp_async) {
                     cp_async_wait_all();
                 }
                 __syncthreads();
             }
+        } else if constexpr (nbatch_V2 < DV/2) {
+            // Partial V tile: the K tile fills the shared memory of one stage, so V is loaded
+            // one chunk at a time here.
+            if (i0_start > 0) {
+                __syncthreads(); // The previous iteration reads the V tile.
+            }
+            const int i0_diff = i0_stop - i0_start;
+            constexpr bool use_cp_async = cp_async_supported;
+            flash_attn_ext_f16_load_tile<stride_tile_V, swz_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
+                (V_h2 + i0_start/2, tile_V, i0_diff/2, stride_V, k_VKQ_0, k_VKQ_sup, nullptr);
+            if constexpr (use_cp_async) {
+                cp_async_wait_all();
+            }
+            __syncthreads();
         }
         const half2 * tile_V_i = !V_is_K_view || i0_stop > 2*nbatch_K2 ? tile_V : tile_V + i0_start/2;
 
@@ -1309,7 +1344,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     if constexpr (nstages > 1) {
         static_assert(!use_sparse, "sparse gather not implemented for multi-stage loading");
         static_assert(nbatch_K2 == DKQ/2, "batching not implemented for multi-stage pipeline");
-        constexpr bool use_cp_async = true;
+        constexpr bool use_cp_async = cp_async_supported;
         constexpr bool oob_check    = false;
         constexpr int  k_VKQ_sup    = nbatch_fa;
         if (ncols2 > 1 || mask_h) {
@@ -2005,6 +2040,26 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
         std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
                  nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
+
+    // Report the config that was picked from the per-architecture table and the shared memory it
+    // needs. Without this there is no way to tell from a log which table entry was used.
+    {
+        static bool config_logged = false;
+        if (!config_logged) {
+            config_logged = true;
+            GGML_LOG_DEBUG("fattn-mma-f16: DKQ %d DV %d ncols1 %d ncols2 %d cc %d -> nthreads %d occupancy %d "
+                "nbatch_fa %d K2 %d V2 %d combine %d nstages %d Q_in_reg %d, smem %zu B\n",
+                DKQ, DV, ncols1, ncols2, cc, nthreads,
+                ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols, cc), nbatch_fa, nbatch_K2, nbatch_V2,
+                nbatch_combine, nstages, int(Q_in_reg), nbytes_shared_total);
+        }
+    }
+
+    const size_t smem_limit = ggml_cuda_info().devices[id].smpbo;
+    if (nbytes_shared_total > smem_limit) {
+        GGML_LOG_WARN("fattn-mma-f16: DKQ %d DV %d ncols1 %d ncols2 %d needs %zu B of shared memory, "
+            "device %d allows %zu B\n", DKQ, DV, ncols1, ncols2, nbytes_shared_total, id, smem_limit);
+    }
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
